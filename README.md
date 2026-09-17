@@ -1,82 +1,95 @@
 # VERDICT
 
-VERDICT is a small browser tool for making a hard choice when you are stuck comparing options.
-
-I built it for the kind of buying decision where every option has tradeoffs, the reviews blur together, and you keep reopening the same tabs instead of choosing.
-
-It does not use AI, accounts, APIs, or a backend. Everything runs in the browser.
-
-## What It Helps With
-
-Use VERDICT when you are choosing between things like:
-
-- headphones
-- monitors
-- laptops
-- e-readers
-- bikes
-- board games
-- any purchase where the answer depends on what you personally care about
-
-The goal is not to tell you what is objectively best. The goal is to help you pick what best matches your priorities.
-
-## How It Works
-
-VERDICT walks you through a decision in a few simple steps.
-
-1. Add the options you are comparing.
-2. Add the things that matter to you.
-3. Compare those priorities two at a time.
-4. Score each option against those priorities.
-5. Get a ranked result with an explanation.
-
-Instead of asking you to guess importance percentages upfront, VERDICT asks easier either-or questions like:
-
-```text
-Which matters more: price or build quality?
-```
-
-That makes the weighting feel more natural, especially when you are not sure how to quantify what matters.
-
-## What The Result Shows
-
-The final result gives you:
-
-- the recommended option
-- why it won
-- what came second
-- why the other options fell behind
-- how much each priority mattered
-- whether the result stayed stable when the priorities were nudged
-
-That last part is useful because close decisions can be misleading. If a tiny change in priorities flips the result, VERDICT tells you the decision is close instead of pretending the answer is obvious.
-
-## The Logic Behind It
-
-Under the hood, VERDICT uses a few decision-making methods:
-
-- AHP to work out how important each priority is
-- TOPSIS to rank the options
-- minimax regret to check which option is least likely to feel like a mistake later
-- sensitivity analysis to test whether the winner is stable
-
-You do not need to know those methods to use the app. They are there to make the decision more structured and less vibes-based.
-
-## Live Demo
+A browser tool for putting numbers to a decision. Enter the values of each option's
+features, weigh how much those features matter to you, and compare the results.
 
 [Open VERDICT](https://sunnysangar.com/VERDICT/index)
 
-## Local Development
+## Using it
+
+1. Add 2–8 options and 3–6 priorities, such as price, comfort, and battery life.
+2. Compare the priorities two at a time to work out their weights.
+3. Enter a value for each option: a number, a 0–10 rating, or a yes/no answer.
+4. Compare the rankings and see how they change when the weights are adjusted.
+
+For numbers, choose whether lower or higher is better. For yes/no features, yes is
+preferred. Ratings start at 5 and can be changed. A yes/no answer must be selected
+explicitly; an unanswered question is not treated as No.
+
+The result shows the leading option, its tradeoffs, your priority weights, and two
+alternative ways of comparing the same inputs. Equal top scores are shown as a
+tie. Use **Edit ratings**, **Redo the weighting**, or **Edit decision** to explore
+changes without clearing everything.
+
+The ereader example contains practice prices and ratings, not current product
+information. It is there to demonstrate the workflow.
+
+## How the numbers work
+
+- **Weights:** pairwise comparisons use ratios of 1, 3, or 5 in either direction.
+  AHP's row geometric mean method converts these into weights that sum to 100%.
+  An approximate consistency ratio flags conflicting comparisons above 0.1.
+- **Feature values:** numerical inputs are rescaled from 0 to 10 within the current
+  option set, reversing the scale for costs. An equal-value column gets 5 for every
+  option. Yes/no becomes 10/0, and rating sliders already use 0–10.
+- **Main ranking:** TOPSIS applies vector normalization and the weights, then scores
+  each option by its distance from the best and worst feature combinations.
+- **Cross-checks:** weighted sum adds the weighted scores; minimax regret finds the
+  smallest worst weighted shortfall on any one feature.
+- **Sensitivity:** each weight is multiplied by 0.75 and 1.25, one at a time, and
+  all weights are rescaled to sum to 100%. A shared lead is recorded separately
+  from keeping a sole lead.
+
+A relative score of 80 is not an 80% chance of being satisfied. The numbers describe
+the options and inputs you supplied. Adding or removing an option can change the
+normalization and rankings. Preferred features are weighted tradeoffs, not hard
+requirements that automatically exclude an option.
+
+Weights and ratings are processed in your browser, with no accounts or decision
+API. The app loads Google Fonts, but does not send decision inputs to a server.
+Decisions are held in memory: reloading or closing the tab clears them.
+
+## Development and checks
+
+Use Node.js 24 and pnpm 11.19.0 (recorded in `package.json`).
 
 ```bash
-npm install
-npm run dev
+pnpm install --frozen-lockfile
+pnpm dev
 ```
 
-## Build
+Open the local `/VERDICT/` URL printed by Vite. To check a production build:
 
 ```bash
-npm run build
+pnpm test
+pnpm build
+pnpm exec playwright install chromium
+pnpm test:browser
 ```
 
-The GitHub Pages workflow builds the app and publishes the generated static files.
+The tests cover known calculation examples, ties, missing answers, numeric edge
+cases, editing decisions, keyboard navigation, and mobile layout. The lockfile
+records the tested dependency versions.
+
+## Publishing to the portfolio
+
+This repository contains the source. The live app is served from the `VERDICT/`
+directory of [the portfolio repository](https://github.com/SunnyS29/SunnyS29.github.io).
+Its HTML and JavaScript should come from the production build, not a hand-maintained
+copy of the React source.
+
+After the checks pass:
+
+```bash
+pnpm sync:website /path/to/SunnyS29.github.io
+```
+
+The script builds VERDICT and copies the output into that checkout. Review and
+commit the `VERDICT/` changes there, then push the portfolio repository to publish.
+Keep prior hashed JavaScript files so cached pages can still load them.
+
+GitHub Actions checks this source repository on pushes and pull requests. Publishing
+uses the portfolio's existing Pages deployment; VERDICT does not need a second
+Pages site enabled on this repository.
+
+See [the audit notes](AUDIT.md) for the September 2026 fixes and verification scope.

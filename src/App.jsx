@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { answerMissing, evaluateDecision } from "./decision.js";
 
 /* ============================================================
    VERDICT: a standalone decision framework. No AI, no API.
@@ -63,6 +64,19 @@ const FONTS = (
     .vd-chipbtn:hover { border-color: var(--blue); color: var(--blue); border-style: solid; }
     .vd-hint { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--ink-soft);
       margin-top: 8px; line-height: 1.6; }
+
+    .vd-row { flex-wrap: wrap; }
+    .vd-row > .vd-input { flex: 1; min-width: 0; }
+    .vd-ghost:disabled, .vd-chipbtn:disabled { opacity: .5; cursor: not-allowed; }
+    .vd-tag { max-width: 100%; flex-wrap: wrap; overflow-wrap: anywhere; }
+    .vd-tag button { flex-shrink: 0; }
+    .vd-vs-name, .vd-fork-q, .vd-win-name, .vd-item, .vd-kicker,
+    .vd-score-name, .vd-why, .vd-chip { overflow-wrap: anywhere; min-width: 0; }
+    .vd-score-name { gap: 12px; flex-wrap: wrap; }
+    .vd-score-val { flex-shrink: 0; }
+    .vd-meter-row { flex-wrap: wrap; }
+    .vd-bar { min-width: 60px; }
+    .vd-int > span:last-child { min-width: 0; overflow-wrap: anywhere; }
 
     /* pairwise fork */
     .vd-kicker { font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600;
@@ -159,176 +173,6 @@ const FONTS = (
 
 /* ================= decision mathematics ================= */
 
-// Convert raw answers (sliders, yes/no, real numbers) into comparable 0-10 scores
-function normalizeScores(options, criteria, raw) {
-  const norm = {};
-  options.forEach((o) => (norm[o.id] = {}));
-  criteria.forEach((c) => {
-    if (c.type === "yesno") {
-      options.forEach((o) => (norm[o.id][c.id] = raw[o.id][c.id] === true ? 10 : 0));
-    } else if (c.type === "number") {
-      const vals = options.map((o) => Number(raw[o.id][c.id]));
-      const min = Math.min(...vals), max = Math.max(...vals);
-      options.forEach((o, i) => {
-        let v = max === min ? 5 : ((vals[i] - min) / (max - min)) * 10;
-        if (c.lowerBetter) v = 10 - v;
-        norm[o.id][c.id] = v;
-      });
-    } else {
-      options.forEach((o) => (norm[o.id][c.id] = Number(raw[o.id][c.id])));
-    }
-  });
-  return norm;
-}
-
-// Show a raw answer in human terms
-function fmtRaw(c, v) {
-  if (c.type === "yesno") return v === true ? "yes" : "no";
-  if (c.type === "number") return `${v}`;
-  return `${v}/10`;
-}
-
-// --- AHP: weights from pairwise judgments (geometric mean method) + consistency ratio
-function ahp(criteria, judgments) {
-  const n = criteria.length;
-  // build full reciprocal comparison matrix
-  const M = Array.from({ length: n }, (_, i) =>
-    Array.from({ length: n }, (_, j) => {
-      if (i === j) return 1;
-      const key = i < j ? `${i}-${j}` : `${j}-${i}`;
-      const v = judgments[key] ?? 1;
-      return i < j ? v : 1 / v;
-    })
-  );
-  // geometric mean of each row → normalised weights
-  const gm = M.map((row) => Math.pow(row.reduce((p, v) => p * v, 1), 1 / n));
-  const sum = gm.reduce((a, b) => a + b, 0);
-  const w = gm.map((v) => v / sum);
-  // consistency: lambda_max via (M·w)_i / w_i
-  const Mw = M.map((row) => row.reduce((s, v, j) => s + v * w[j], 0));
-  const lambdaMax = Mw.reduce((s, v, i) => s + v / w[i], 0) / n;
-  const CI = (lambdaMax - n) / (n - 1 || 1);
-  const RI = [0, 0, 0.58, 0.9, 1.12, 1.24, 1.32, 1.41][n - 1] || 1.45;
-  const CR = n <= 2 ? 0 : CI / RI;
-  const weights = {};
-  criteria.forEach((c, i) => (weights[c.id] = w[i]));
-  return { weights, CR };
-}
-
-// --- TOPSIS: closeness to ideal solution
-function topsis(options, criteria, weights, scores) {
-  const ids = criteria.map((c) => c.id);
-  const norms = {};
-  ids.forEach((id) => {
-    norms[id] = Math.sqrt(options.reduce((s, o) => s + Math.pow(scores[o.id][id], 2), 0)) || 1;
-  });
-  const W = options.map((o) => ids.map((id) => (scores[o.id][id] / norms[id]) * weights[id]));
-  const ideal = ids.map((_, j) => Math.max(...W.map((r) => r[j])));
-  const anti = ids.map((_, j) => Math.min(...W.map((r) => r[j])));
-  return options
-    .map((o, i) => {
-      const dP = Math.sqrt(W[i].reduce((s, v, j) => s + (v - ideal[j]) ** 2, 0));
-      const dM = Math.sqrt(W[i].reduce((s, v, j) => s + (v - anti[j]) ** 2, 0));
-      return { ...o, closeness: dP + dM === 0 ? 0 : dM / (dP + dM) };
-    })
-    .sort((a, b) => b.closeness - a.closeness);
-}
-
-// --- weighted-sum cross-check (SAW)
-function weightedSum(options, criteria, weights, scores) {
-  return options
-    .map((o) => ({
-      ...o,
-      total: criteria.reduce((s, c) => s + weights[c.id] * (scores[o.id][c.id] / 10), 0),
-    }))
-    .sort((a, b) => b.total - a.total);
-}
-
-// --- minimax regret: weighted opportunity loss vs the best on each criterion
-function minimaxRegret(options, criteria, weights, scores) {
-  const best = {};
-  criteria.forEach((c) => {
-    best[c.id] = Math.max(...options.map((o) => scores[o.id][c.id]));
-  });
-  return options
-    .map((o) => ({
-      ...o,
-      maxRegret: Math.max(
-        ...criteria.map((c) => weights[c.id] * (best[c.id] - scores[o.id][c.id]))
-      ),
-    }))
-    .sort((a, b) => a.maxRegret - b.maxRegret);
-}
-
-// --- sensitivity: perturb each weight ±25%, does the TOPSIS winner survive?
-function sensitivity(options, criteria, weights, scores, winnerId) {
-  let held = 0, total = 0;
-  for (const c of criteria) {
-    for (const factor of [0.75, 1.25]) {
-      const w = { ...weights, [c.id]: weights[c.id] * factor };
-      const s = Object.values(w).reduce((a, b) => a + b, 0);
-      Object.keys(w).forEach((k) => (w[k] = w[k] / s));
-      total++;
-      if (topsis(options, criteria, w, scores)[0].id === winnerId) held++;
-    }
-  }
-  return held / total;
-}
-
-// plain-language rationale, generated from the numbers
-function buildRationale(ranked, criteria, weights, scores, raw, regretRank, robustness, sawAgrees) {
-  const win = ranked[0], run = ranked[1];
-  const sorted = [...criteria].sort((a, b) => weights[b.id] - weights[a.id]);
-  const advantages = sorted.filter((c) => scores[win.id][c.id] >= scores[run.id][c.id]);
-  const topAdv = advantages.slice(0, 2).map((c) => c.name);
-  const concession = sorted.find((c) => scores[win.id][c.id] < scores[run.id][c.id]);
-  const advWeight = advantages.reduce((s, c) => s + weights[c.id], 0);
-
-  let why = `${win.name} comes out on top for ${topAdv.join(" and ") || "the things you care about most"}, and wins on the factors that carry ${Math.round(advWeight * 100)}% of what you said matters.`;
-  if (concession)
-    why += ` It gives up a little on ${concession.name.toLowerCase()}, but not enough to change the answer.`;
-  if (regretRank[0].id === win.id)
-    why += ` It's also the safest pick: whichever way things go, it leaves the least on the table.`;
-  if (sawAgrees) why += ` Two different ways of running the numbers both land on it.`;
-
-  const runnerCrit = [...criteria].sort(
-    (a, b) =>
-      weights[b.id] * (scores[run?.id]?.[b.id] - scores[win.id][b.id]) -
-      weights[a.id] * (scores[run?.id]?.[a.id] - scores[win.id][a.id])
-  )[0];
-  const runnerNote = run
-    ? scores[run.id][runnerCrit.id] > scores[win.id][runnerCrit.id]
-      ? `Pick ${run.name} only if ${runnerCrit.name.toLowerCase()} matters more to you than your tradeoff answers suggested.`
-      : `${run.name} never actually beats the winner where it counts for you.`
-    : "";
-
-  const whyNot = ranked.slice(2).map((o) => {
-    const worst = [...criteria].sort(
-      (a, b) =>
-        weights[b.id] * (scores[ranked[0].id][b.id] - scores[o.id][b.id]) -
-        weights[a.id] * (scores[ranked[0].id][a.id] - scores[o.id][a.id])
-    )[0];
-    let reason;
-    if (worst.type === "yesno" && raw[o.id][worst.id] !== true && raw[ranked[0].id][worst.id] === true) {
-      reason = `It's missing ${worst.name.toLowerCase()}, which the winner has, and you said that matters.`;
-    } else if (worst.type === "number") {
-      reason = `Its ${worst.name.toLowerCase()} of ${fmtRaw(worst, raw[o.id][worst.id])} loses out to the winner's ${fmtRaw(worst, raw[ranked[0].id][worst.id])}, and that's one of the things you said matters most.`;
-    } else {
-      reason = `Falls well behind on ${worst.name.toLowerCase()} (${fmtRaw(worst, raw[o.id][worst.id])} vs the winner's ${fmtRaw(worst, raw[ranked[0].id][worst.id])}), and that's one of the things you said matters most.`;
-    }
-    return { name: o.name, reason };
-  });
-
-  const closer =
-    robustness >= 0.9
-      ? "This answer barely budges even when your priorities get shaken up. You can stop researching now."
-      : robustness >= 0.7
-        ? "This answer holds up under most shifts in your priorities. It's safe to commit."
-        : "This one is genuinely close. The top two are nearly interchangeable, so pick either one and don't look back.";
-
-  return { why, runnerNote, whyNot, closer };
-}
-
 /* ================= UI data ================= */
 
 const SUGGESTED = [
@@ -385,6 +229,14 @@ export default function Verdict() {
   const [scores, setScores] = useState({});
   const [critIdx, setCritIdx] = useState(0);
   const [result, setResult] = useState(null);
+  const [error, setError] = useState("");
+  const stageRef = useRef(null);
+  useEffect(() => {
+    if (phase !== "setup") {
+      stageRef.current?.querySelector("h1")?.focus();
+      window.scrollTo(0, 0);
+    }
+  }, [phase, pairIdx, critIdx]);
 
   const addOption = (label) => {
     const v = (label ?? optDraft).trim();
@@ -432,7 +284,7 @@ export default function Verdict() {
         criteria.forEach((c) => {
           const cur = next[o.id][c.id];
           if (c.type === "yesno") {
-            if (typeof cur !== "boolean") next[o.id][c.id] = false;
+            if (typeof cur !== "boolean") next[o.id][c.id] = null;
           } else if (c.type === "number") {
             if (typeof cur !== "number" && cur !== "" && typeof cur !== "string") next[o.id][c.id] = "";
           } else if (typeof cur !== "number") {
@@ -442,6 +294,7 @@ export default function Verdict() {
       });
       return next;
     });
+    setError("");
     setPhase("weigh");
   };
 
@@ -459,26 +312,22 @@ export default function Verdict() {
   const setScore = (optId, critId, v) =>
     setScores((prev) => ({ ...prev, [optId]: { ...prev[optId], [critId]: v } }));
 
-  const numbersMissing = (c) =>
-    c.type === "number" &&
-    options.some((o) => scores[o.id]?.[c.id] === "" || !Number.isFinite(Number(scores[o.id]?.[c.id])));
+  const answersMissing = (c) => options.some((o) => answerMissing(c, scores[o.id]?.[c.id]));
 
   const finishScoring = () => {
-    const norm = normalizeScores(options, criteria, scores);
-    const { weights, CR } = ahp(criteria, judgments);
-    const ranked = topsis(options, criteria, weights, norm);
-    const saw = weightedSum(options, criteria, weights, norm);
-    const regretRank = minimaxRegret(options, criteria, weights, norm);
-    const robustness = sensitivity(options, criteria, weights, norm, ranked[0].id);
-    const sawAgrees = saw[0].id === ranked[0].id;
-    const rationale = buildRationale(ranked, criteria, weights, norm, scores, regretRank, robustness, sawAgrees);
-    setResult({ weights, CR, ranked, saw, regretRank, robustness, sawAgrees, rationale });
-    setPhase("verdict");
+    setError("");
+    try {
+      setResult(evaluateDecision(options, criteria, scores, judgments));
+      setPhase("verdict");
+    } catch (err) {
+      setError(err.message);
+    }
   };
 
   const reset = () => {
     setPhase("setup"); setName(""); setOptions([]); setCriteria([]);
-    setJudgments({}); setScores({}); setResult(null); setPairIdx(0); setCritIdx(0);
+    setJudgments({}); setScores({}); setResult(null); setPairIdx(0); setCritIdx(0); setError("");
+    setOptDraft(""); setCritDraft(""); setCritType("scale"); setPairs([]);
   };
 
   const sortedW = result
@@ -488,7 +337,7 @@ export default function Verdict() {
   return (
     <div className="vd-root">
       {FONTS}
-      <div className="vd-shell">
+      <main className="vd-shell" ref={stageRef}>
         <div className="vd-brand">
           <div className="vd-logo">Verdict<span>.</span><sup style={{ fontSize: 10, letterSpacing: 0, marginLeft: 2 }}>™</sup></div>
           <div className="vd-step">
@@ -502,11 +351,11 @@ export default function Verdict() {
         {/* ---------- SETUP ---------- */}
         {phase === "setup" && (
           <div>
-            <h1 className="vd-h1">Stop researching.<br />Start deciding.</h1>
+            <h1 className="vd-h1" tabIndex={-1}>Compare your options.</h1>
             <p className="vd-sub">
-              Can't choose? List your options, answer a few easy either/or questions,
-              and this tool runs the numbers and hands you one clear answer, plus proof
-              it can back it up. Everything happens on your device.
+              List your options, compare your priorities, and rate each choice.
+              See which options rank highest and how the result changes when you
+              adjust what matters. Your answers stay in this browser tab.
             </p>
             <div style={{ marginTop: 16 }}>
               <button className="vd-ghost" onClick={loadExample}>
@@ -514,14 +363,14 @@ export default function Verdict() {
               </button>
               {name === EXAMPLE.name && (
                 <p className="vd-hint" style={{ marginTop: 8 }}>
-                  Example loaded. Everything below is filled in, including the ratings,
-                  so you can just click through and watch it work.
+                  Practice example loaded, including sample prices and ratings.
+                  These are not current product prices or verified specifications.
                 </p>
               )}
             </div>
 
             <label className="vd-label" htmlFor="vd-name">Step 1 · What are you deciding?</label>
-            <input id="vd-name" className="vd-input" value={name}
+            <input id="vd-name" className="vd-input" value={name} maxLength={200}
               onChange={(e) => setName(e.target.value)}
               placeholder="e.g. Which ereader should I buy?" />
 
@@ -531,7 +380,7 @@ export default function Verdict() {
             <p className="vd-hint" style={{ marginTop: 0, marginBottom: 10 }}>
               These are the specific products, places, or choices on your list. Type one
               at a time and press Add. For an ereader that might be "Kindle Paperwhite",
-              then "Kobo Clara", and so on. You need at least 2.
+              then "Kobo Clara", and so on. Add between 2 and 8 options.
             </p>
             <div style={{ marginBottom: 8 }}>
               {options.map((o) => (
@@ -543,20 +392,21 @@ export default function Verdict() {
               ))}
             </div>
             <div className="vd-row">
-              <input id="vd-opt" className="vd-input" value={optDraft}
+              <input id="vd-opt" className="vd-input" value={optDraft} maxLength={100}
                 onChange={(e) => setOptDraft(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && addOption()}
                 placeholder="Type one option, e.g. Kindle Paperwhite" />
-              <button className="vd-ghost" onClick={() => addOption()}>Add</button>
+              <button className="vd-ghost" disabled={options.length >= 8} onClick={() => addOption()}>Add</button>
             </div>
 
-            <label className="vd-label">
+            <label className="vd-label" htmlFor="vd-criterion">
               Step 3 · Add what matters to you, in your own words (3 to 6 things)
             </label>
             <p className="vd-hint" style={{ marginTop: 0, marginBottom: 10 }}>
-              Anything you'd weigh up when choosing: price, comfort, a feature it must
-              have. Type it below, then pick how you'll answer it: a 0 to 10 rating for
-              feelings, yes or no for features, or a real number for facts like price.
+              Anything you'd weigh up when choosing: price, comfort, or a feature you would
+              prefer. Type it below, then pick how you'll answer it: a 0 to 10 rating for
+              preferences, yes or no for features (yes is better), or a number for facts like price.
+              A missing feature does not automatically exclude an option.
             </p>
             <div style={{ marginBottom: 8 }}>
               {criteria.map((c) => (
@@ -570,7 +420,7 @@ export default function Verdict() {
               ))}
             </div>
             <div className="vd-row" style={{ flexWrap: "wrap" }}>
-              <input className="vd-input" style={{ flex: "1 1 200px" }} value={critDraft}
+              <input id="vd-criterion" className="vd-input" maxLength={100} style={{ flex: "1 1 200px" }} value={critDraft}
                 onChange={(e) => setCritDraft(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && addCriterion()}
                 placeholder="Type something that matters, e.g. has warm light" />
@@ -582,7 +432,7 @@ export default function Verdict() {
                 <option value="number-low">It's a number, lower is better</option>
                 <option value="number-high">It's a number, higher is better</option>
               </select>
-              <button className="vd-ghost" onClick={() => addCriterion()}>Add</button>
+              <button className="vd-ghost" disabled={criteria.length >= 6} onClick={() => addCriterion()}>Add</button>
             </div>
             <p className="vd-hint" style={{ marginTop: 14, marginBottom: 6 }}>
               Stuck for ideas? A few common ones you can tap:
@@ -591,7 +441,7 @@ export default function Verdict() {
               {SUGGESTED.filter((s) => !criteria.some((c) => c.name === s.n))
                 .slice(0, 4)
                 .map((s) => (
-                  <button className="vd-chipbtn" key={s.n} onClick={() => addCriterion(s)}>
+                  <button className="vd-chipbtn" key={s.n} disabled={criteria.length >= 6} onClick={() => addCriterion(s)}>
                     + {s.n}
                   </button>
                 ))}
@@ -622,7 +472,7 @@ export default function Verdict() {
           return (
             <div>
               <div className="vd-kicker">{name || "your decision"} · working out what matters most to you</div>
-              <div className="vd-fork-q">Which matters more?</div>
+              <h1 className="vd-fork-q" tabIndex={-1}>Which matters more?</h1>
               <div className="vd-vs">
                 <div className="vd-vs-name" style={{ color: "var(--blue-dark)" }}>
                   <span className="vd-kicker" style={{ display: "block" }}>A</span>{A}
@@ -647,17 +497,13 @@ export default function Verdict() {
                 ))}
               </div>
               <div className="vd-row" style={{ marginTop: 16 }}>
-                {pairIdx > 0 && (
-                  <button className="vd-ghost" onClick={() => setPairIdx(pairIdx - 1)}>
-                    ← Back a question
-                  </button>
-                )}
+                <button className="vd-ghost" onClick={() => pairIdx > 0 ? setPairIdx(pairIdx - 1) : setPhase("setup")}>
+                  {pairIdx > 0 ? "← Back a question" : "← Edit decision"}
+                </button>
               </div>
               <p className="vd-hint" style={{ marginTop: 14 }}>
-                Why two at a time? Because comparing two things is easy and rating ten things
-                at once is not. Your answers quietly build a picture of how much each factor
-                really matters to you, and the tool even checks whether your answers agree
-                with each other.
+                These comparisons determine the weight of each priority.
+                The result also checks whether your comparisons are consistent.
               </p>
             </div>
           );
@@ -669,14 +515,14 @@ export default function Verdict() {
             <div className="vd-kicker">
               rating {critIdx + 1} of {criteria.length}
             </div>
-            <div className="vd-fork-q">{criteria[critIdx].name}</div>
+            <h1 className="vd-fork-q" tabIndex={-1}>{criteria[critIdx].name}</h1>
             <p className="vd-sub" style={{ marginBottom: 20 }}>
               {criteria[critIdx].type === "yesno" &&
-                "Simple one. Does each option have it, yes or no?"}
+                "Does each option have this feature? Choose Yes or No for every option."}
               {criteria[critIdx].type === "number" &&
                 `Type the actual number for each option. ${criteria[critIdx].lowerBetter ? "Lower" : "Higher"} is better here, and the tool will compare them for you.`}
               {criteria[critIdx].type === "scale" &&
-                "Just on this one thing, how does each option do? 0 means terrible, 10 means as good as it gets. Forget everything else for now."}
+                "Rate each option on this priority: 0 is worst and 10 is best. Ratings start at 5; adjust them to reflect your assessment."}
             </p>
             {options.map((o) => {
               const c = criteria[critIdx];
@@ -694,13 +540,13 @@ export default function Verdict() {
                       onChange={(e) => setScore(o.id, c.id, Number(e.target.value))} />
                   )}
                   {c.type === "yesno" && (
-                    <div className="vd-row">
-                      <button className="vd-ghost"
+                    <div className="vd-row" role="group" aria-label={`${o.name}: ${c.name}`}>
+                      <button className="vd-ghost" aria-pressed={val === true}
                         style={val === true
                           ? { borderColor: "var(--green)", color: "var(--green)", fontWeight: 700 }
                           : {}}
                         onClick={() => setScore(o.id, c.id, true)}>Yes</button>
-                      <button className="vd-ghost"
+                      <button className="vd-ghost" aria-pressed={val === false}
                         style={val === false
                           ? { borderColor: "var(--rust)", color: "var(--rust)", fontWeight: 700 }
                           : {}}
@@ -708,7 +554,7 @@ export default function Verdict() {
                     </div>
                   )}
                   {c.type === "number" && (
-                    <input type="number" inputMode="decimal" className="vd-input"
+                    <input type="number" step="any" inputMode="decimal" className="vd-input"
                       aria-label={`${o.name}: ${c.name}`}
                       value={val ?? ""}
                       placeholder={c.lowerBetter ? "e.g. 249" : "e.g. 12"}
@@ -727,15 +573,16 @@ export default function Verdict() {
                 ← Back
               </button>
               <button className="vd-btn" style={{ marginTop: 0 }}
-                disabled={numbersMissing(criteria[critIdx])}
+                disabled={answersMissing(criteria[critIdx])}
                 onClick={() =>
                   critIdx + 1 < criteria.length ? setCritIdx(critIdx + 1) : finishScoring()
                 }>
                 {critIdx + 1 < criteria.length ? "Next →" : "Get my answer →"}
               </button>
             </div>
-            {numbersMissing(criteria[critIdx]) && (
-              <p className="vd-hint">Fill in a number for every option to continue.</p>
+            {error && <p className="vd-note" role="alert">{error}</p>}
+            {answersMissing(criteria[critIdx]) && (
+              <p className="vd-hint">Answer for every option to continue.</p>
             )}
           </div>
         )}
@@ -744,46 +591,44 @@ export default function Verdict() {
         {phase === "verdict" && result && (
           <div>
             <div className="vd-kicker">{name || "your decision"} · the answer is in</div>
-            <h1 className="vd-h1">Pick this one.</h1>
+            <h1 className="vd-h1" tabIndex={-1}>{result.top.length > 1 ? "No single winner." : "Your leading option."}</h1>
 
             <div className="vd-stamp-wrap">
-              <div className="vd-stamp">Verdict</div>
-              <div className="vd-win-name">{result.ranked[0].name}</div>
+              <div className="vd-stamp">{result.top.length > 1 ? "Tied" : "Verdict"}</div>
+              <div className="vd-win-name">{result.top.map((o) => o.name).join(" / ")}</div>
               <p className="vd-why">{result.rationale.why}</p>
               <div style={{ marginTop: 18 }}>
                 <div className="vd-meter-row">
-                  <span className="lbl">fit score</span>
+                  <span className="lbl">relative score</span>
                   <div className="vd-bar"><i style={{ width: `${result.ranked[0].closeness * 100}%` }} /></div>
                   <span>{Math.round(result.ranked[0].closeness * 100)} / 100</span>
                 </div>
-                <div className="vd-meter-row">
-                  <span className="lbl">steadiness</span>
-                  <div className="vd-bar g"><i style={{ width: `${result.robustness * 100}%` }} /></div>
-                  <span>
-                    stays the winner {Math.round(result.robustness * 100)}% of the time
-                  </span>
-                </div>
+                {result.top.length === 1 && <div className="vd-meter-row">
+                  <span className="lbl">weight checks</span>
+                  <div className="vd-bar g"><i style={{ width: `${result.stress.fraction * 100}%` }} /></div>
+                  <span>{result.stress.held} of {result.stress.total} kept this sole leader</span>
+                </div>}
+                <p className="vd-hint">Scores compare these options using your ratings. They are not probabilities of a good purchase.</p>
               </div>
             </div>
 
             {result.CR > 0.1 && (
               <div className="vd-note">
-                One thing to know: some of your either/or answers pulled in different
-                directions, which happens to everyone. The answer still stands, but if
-                it feels off, redo the questions and see if it changes.
+                Some priority comparisons conflict (consistency ratio {result.CR.toFixed(2)}).
+                Review the weighting before relying on this ranking.
               </div>
             )}
             {result.CR <= 0.1 && criteria.length > 2 && (
               <div className="vd-note ok">
-                Nice one: your either/or answers all lined up with each other, so the
-                result genuinely reflects what you said matters.
+                No large inconsistency was detected in your priority comparisons
+                (consistency ratio {result.CR.toFixed(2)}).
               </div>
             )}
 
-            {result.ranked[1] && (
+            {result.top.length === 1 && result.ranked[1] && (
               <div className="vd-runner">
                 <div className="vd-kicker">
-                  second place · fit score {Math.round(result.ranked[1].closeness * 100)}
+                  next option · relative score {Math.round(result.ranked[1].closeness * 100)}
                 </div>
                 <h3>{result.ranked[1].name}</h3>
                 <p className="vd-why" style={{ marginTop: 8, fontSize: 14.5 }}>
@@ -794,7 +639,7 @@ export default function Verdict() {
 
             {result.rationale.whyNot.length > 0 && (
               <div className="vd-section">
-                <div className="vd-kicker">Why not the others</div>
+                <div className="vd-kicker">Other comparisons</div>
                 {result.rationale.whyNot.map((w, i) => (
                   <div className="vd-item" key={i}>
                     <b>{w.name}</b>
@@ -820,27 +665,27 @@ export default function Verdict() {
               <div className="vd-item">
                 <b>A second opinion</b>
                 <span>
-                  {result.sawAgrees
-                    ? `The result was checked with a second, simpler way of adding up the scores. It also picks ${result.saw[0].name}.`
-                    : `A second, simpler way of adding up the scores prefers ${result.saw[0].name}. When two methods disagree, it means the race is very close, so treat the top two as equally good choices.`}
+                  {result.sawLeaders.length > 1
+                    ? `Adding the weighted scores gives a shared top score to ${result.sawLeaders.map((o) => o.name).join(" and ")}.`
+                    : result.sawAgrees
+                      ? `Adding the weighted scores also ranks ${result.saw[0].name} first.`
+                      : `Adding the weighted scores ranks ${result.saw[0].name} first. These methods combine your ratings differently; disagreement does not establish that the choices are equally good.`}
                 </span>
               </div>
               <div className="vd-item">
-                <b>The no-regrets check</b>
+                <b>Largest shortfall</b>
                 <span>
-                  {result.regretRank[0].name} is the pick you'd be least likely to kick
-                  yourself over later
-                  {result.regretRank[0].id === result.ranked[0].id
-                    ? ", and it's the same as the winner. Good sign."
-                    : ". Worth knowing if avoiding buyer's remorse matters more to you than getting the absolute best."}
+                  {result.regretLeaders.map((o) => o.name).join(" and ")} {result.regretLeaders.length > 1 ? "share" : "has"} the smallest
+                  worst shortfall on any one priority, after applying your weights and
+                  comparing against the best score for that priority.
                 </span>
               </div>
               <div className="vd-item">
                 <b>The stress test</b>
                 <span>
-                  We nudged your priorities up and down and re-ran the whole thing{" "}
-                  {2 * criteria.length} times. The winner came out on top in{" "}
-                  {Math.round(result.robustness * 100)}% of those re-runs.
+                  {result.top.length > 1
+                    ? "The base ranking is tied, so there is no single winner to describe as stable."
+                    : `Each priority was increased and decreased by 25%, one at a time, then all weights were rescaled to sum to 100%. ${result.ranked[0].name} remained the sole leader in ${result.stress.held} of ${result.stress.total} scenarios and shared the lead in ${result.stress.tied}. These are limited scenarios, not a probability estimate.`}
                 </span>
               </div>
             </div>
@@ -852,6 +697,8 @@ export default function Verdict() {
               <button className="vd-ghost" onClick={() => { setPairIdx(0); setJudgments({}); setPhase("weigh"); }}>
                 Redo the weighting
               </button>
+              <button className="vd-ghost" onClick={() => { setCritIdx(0); setError(""); setPhase("score"); }}>Edit ratings</button>
+              <button className="vd-ghost" onClick={() => { setResult(null); setPhase("setup"); }}>Edit decision</button>
               <button className="vd-ghost" onClick={reset}>New decision</button>
             </div>
           </div>
@@ -865,7 +712,7 @@ export default function Verdict() {
             sunnysangar.com
           </a>
         </div>
-      </div>
+      </main>
     </div>
   );
 }
