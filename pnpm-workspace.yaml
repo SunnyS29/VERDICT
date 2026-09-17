@@ -1,0 +1,3 @@
+# Vite's pinned bundler installs its platform-specific executable.
+allowBuilds:
+  esbuild@0.25.12: true
