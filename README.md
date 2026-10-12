@@ -93,3 +93,7 @@ uses the portfolio's existing Pages deployment; VERDICT does not need a second
 Pages site enabled on this repository.
 
 See [the audit notes](AUDIT.md) for the September 2026 fixes and verification scope.
+
+## License
+
+Copyright 2026 Sunny Sangar. Public for portfolio review; reuse, redistribution, or modification not permitted without written permission.
